@@ -10,8 +10,8 @@ const {
 } = require('discord.js');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const TOKEN        = process.env.DISCORD_TOKEN;
-const ADMIN_IDS    = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const TOKEN     = process.env.DISCORD_TOKEN;
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 if (!TOKEN) { console.error('❌ DISCORD_TOKEN manquant !'); process.exit(1); }
 
@@ -26,35 +26,28 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// Stockage des sessions snipe en mémoire
 const snipeSessions = new Map();
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 function isAdmin(userId) {
   return ADMIN_IDS.includes(userId);
 }
 
-// ── Ready ─────────────────────────────────────────────────────────────────────
 client.on('ready', () => {
   console.log(`✅ Connecté : ${client.user.tag}`);
   console.log(`   Admins   : ${ADMIN_IDS.join(', ') || '⚠️ aucun configuré'}`);
 });
 
-// ── Messages ──────────────────────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.guild)     return;
 
   const content = message.content.trim();
-
   if (!content.toLowerCase().startsWith('!snipe')) return;
 
-  // Vérification admin
   if (!isAdmin(message.author.id)) {
     return message.reply('❌ Tu n\'as pas la permission d\'utiliser cette commande.');
   }
 
-  // Récupérer la cible (mention ou ID brut)
   const args     = content.split(/\s+/);
   const targetId = message.mentions.users.first()?.id || args[1]?.replace(/\D/g, '');
 
@@ -69,22 +62,30 @@ client.on('messageCreate', async (message) => {
 
   const statusMsg = await message.reply(`🔍 Scan en cours des messages de **${targetUser.tag}**...`);
 
-  // Récupérer tous les salons texte accessibles par le bot
-  const textChannels = message.guild.channels.cache.filter(ch =>
-    ch.isTextBased() &&
-    !ch.isVoiceBased() &&
-    ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ViewChannel) &&
-    ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ReadMessageHistory)
-  );
+  // Salons texte accessibles
+  const channels = message.guild.channels.cache
+    .filter(ch =>
+      ch.isTextBased() &&
+      !ch.isVoiceBased() &&
+      ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ViewChannel) &&
+      ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ReadMessageHistory)
+    )
+    .map(ch => ch);
 
-  // Fetch les 100 derniers messages de chaque salon pour remplir le cache
-  for (const [, ch] of textChannels) {
-    try { await ch.messages.fetch({ limit: 100 }); } catch { /* salon inaccessible */ }
+  // Fetch 100 derniers messages par salon en parallèle (lots de 5, timeout 5s chacun)
+  const fetchChannel = (ch) =>
+    Promise.race([
+      ch.messages.fetch({ limit: 100 }),
+      new Promise((_, rej) => setTimeout(() => rej(), 5000)),
+    ]).catch(() => null);
+
+  for (let i = 0; i < channels.length; i += 5) {
+    await Promise.all(channels.slice(i, i + 5).map(fetchChannel));
   }
 
-  // Collecter les messages de la cible depuis le cache
+  // Collecter les messages de la cible
   const collected = [];
-  for (const [, ch] of textChannels) {
+  for (const ch of channels) {
     for (const [, m] of ch.messages.cache.filter(m => m.author.id === targetId)) {
       collected.push({
         id:          m.id,
@@ -97,7 +98,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // Trier du plus récent au plus ancien
   collected.sort((a, b) => b.createdAt - a.createdAt);
 
   if (collected.length === 0) {
@@ -107,25 +107,24 @@ client.on('messageCreate', async (message) => {
         .setColor(0xFFA500)
         .setTitle('🔍 Aucun message trouvé')
         .setDescription(
-          `Aucun message de <@${targetId}> n'est présent dans le cache.\n` +
-          `> *Seuls les **100 derniers messages** par salon sont visibles.*`
+          `Aucun message de <@${targetId}> trouvé dans le cache.\n` +
+          `> *Seuls les **100 derniers messages** par salon sont scannés.*`
         )
         .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
         .setTimestamp()],
     });
   }
 
-  // ── Pagination ───────────────────────────────────────────────────────────
   const PAGE_SIZE  = 10;
   const totalPages = Math.ceil(collected.length / PAGE_SIZE);
   const sessionId  = `snipe_${message.id}`;
 
   snipeSessions.set(sessionId, {
-    messages:   collected,
-    page:       0,
+    messages:    collected,
+    page:        0,
     totalPages,
     targetId,
-    targetTag:  targetUser.tag,
+    targetTag:   targetUser.tag,
     requesterId: message.author.id,
   });
 
@@ -141,7 +140,6 @@ client.on('messageCreate', async (message) => {
         inline: false,
       };
     });
-
     return new EmbedBuilder()
       .setColor(0xFF4444)
       .setTitle(`🎯 Snipe — ${targetUser.tag}`)
@@ -177,7 +175,6 @@ client.on('messageCreate', async (message) => {
     components: [buildButtons(0)],
   });
 
-  // ── Collector boutons ────────────────────────────────────────────────────
   const collector = statusMsg.createMessageComponentCollector({ time: 10 * 60 * 1000 });
 
   collector.on('collect', async (interaction) => {
@@ -213,16 +210,14 @@ client.on('messageCreate', async (message) => {
         components: [],
       });
 
-      let deleted = 0;
-      let failed  = 0;
-
+      let deleted = 0, failed = 0;
       for (const msgData of session.messages) {
         try {
           const ch = await client.channels.fetch(msgData.channelId).catch(() => null);
           const m  = ch ? await ch.messages.fetch(msgData.id).catch(() => null) : null;
           if (m) { await m.delete(); deleted++; }
           else failed++;
-          await new Promise(r => setTimeout(r, 300)); // anti rate-limit
+          await new Promise(r => setTimeout(r, 300));
         } catch { failed++; }
       }
 
