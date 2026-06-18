@@ -10,8 +10,10 @@ const {
 } = require('discord.js');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const TOKEN     = process.env.DISCORD_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const TOKEN        = process.env.DISCORD_TOKEN;
+const ADMIN_IDS    = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+// Nombre max de messages à remonter par salon (évite les timeouts sur gros serveurs)
+const MAX_PER_CHANNEL = parseInt(process.env.MAX_PER_CHANNEL || '500');
 
 if (!TOKEN) { console.error('❌ DISCORD_TOKEN manquant !'); process.exit(1); }
 
@@ -32,9 +34,52 @@ function isAdmin(userId) {
   return ADMIN_IDS.includes(userId);
 }
 
+// Fetch TOUS les messages d'un salon jusqu'à MAX_PER_CHANNEL, en paginant
+async function fetchAllMessages(channel, targetId, maxMessages) {
+  const results = [];
+  let lastId    = null;
+  let total     = 0;
+
+  while (total < maxMessages) {
+    const options = { limit: 100 };
+    if (lastId) options.before = lastId;
+
+    let batch;
+    try {
+      batch = await channel.messages.fetch(options);
+    } catch {
+      break;
+    }
+
+    if (batch.size === 0) break;
+
+    for (const [, m] of batch) {
+      if (m.author.id === targetId) {
+        results.push({
+          id:          m.id,
+          channelId:   channel.id,
+          content:     m.content || '*[Pas de texte]*',
+          createdAt:   m.createdTimestamp,
+          url:         m.url,
+          attachments: m.attachments.size,
+        });
+      }
+    }
+
+    // Dernier message du batch = le plus ancien → on continue à partir de là
+    lastId  = batch.last().id;
+    total  += batch.size;
+
+    if (batch.size < 100) break; // Plus de messages dans ce salon
+  }
+
+  return results;
+}
+
 client.on('ready', () => {
   console.log(`✅ Connecté : ${client.user.tag}`);
   console.log(`   Admins   : ${ADMIN_IDS.join(', ') || '⚠️ aucun configuré'}`);
+  console.log(`   Max msgs  : ${MAX_PER_CHANNEL} par salon`);
 });
 
 client.on('messageCreate', async (message) => {
@@ -60,7 +105,10 @@ client.on('messageCreate', async (message) => {
     return message.reply(`❌ Utilisateur introuvable pour l'ID \`${targetId}\`.`);
   }
 
-  const statusMsg = await message.reply(`🔍 Scan en cours des messages de **${targetUser.tag}**...`);
+  const statusMsg = await message.reply(
+    `🔍 Scan profond en cours pour **${targetUser.tag}**...\n` +
+    `*(jusqu'à ${MAX_PER_CHANNEL} messages par salon — peut prendre quelques secondes)*`
+  );
 
   // Salons texte accessibles
   const channels = message.guild.channels.cache
@@ -72,30 +120,21 @@ client.on('messageCreate', async (message) => {
     )
     .map(ch => ch);
 
-  // Fetch 100 derniers messages par salon en parallèle (lots de 5, timeout 5s chacun)
-  const fetchChannel = (ch) =>
-    Promise.race([
-      ch.messages.fetch({ limit: 100 }),
-      new Promise((_, rej) => setTimeout(() => rej(), 5000)),
-    ]).catch(() => null);
-
-  for (let i = 0; i < channels.length; i += 5) {
-    await Promise.all(channels.slice(i, i + 5).map(fetchChannel));
-  }
-
-  // Collecter les messages de la cible
+  // Scan chaque salon séquentiellement (pagination complète)
   const collected = [];
+  let scanned = 0;
+
   for (const ch of channels) {
-    for (const [, m] of ch.messages.cache.filter(m => m.author.id === targetId)) {
-      collected.push({
-        id:          m.id,
-        channelId:   ch.id,
-        content:     m.content || '*[Pas de texte]*',
-        createdAt:   m.createdTimestamp,
-        url:         m.url,
-        attachments: m.attachments.size,
-      });
+    scanned++;
+    // Mise à jour du statut toutes les 5 salons
+    if (scanned % 5 === 0) {
+      await statusMsg.edit(
+        `🔍 Scan en cours... **${scanned}/${channels.length}** salons · **${collected.length}** messages trouvés`
+      ).catch(() => {});
     }
+
+    const msgs = await fetchAllMessages(ch, targetId, MAX_PER_CHANNEL);
+    collected.push(...msgs);
   }
 
   collected.sort((a, b) => b.createdAt - a.createdAt);
@@ -107,14 +146,15 @@ client.on('messageCreate', async (message) => {
         .setColor(0xFFA500)
         .setTitle('🔍 Aucun message trouvé')
         .setDescription(
-          `Aucun message de <@${targetId}> trouvé dans le cache.\n` +
-          `> *Seuls les **100 derniers messages** par salon sont scannés.*`
+          `Aucun message de <@${targetId}> trouvé.\n` +
+          `> *${channels.length} salons scannés · ${MAX_PER_CHANNEL} msgs max par salon*`
         )
         .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
         .setTimestamp()],
     });
   }
 
+  // ── Pagination ──────────────────────────────────────────────────────────
   const PAGE_SIZE  = 10;
   const totalPages = Math.ceil(collected.length / PAGE_SIZE);
   const sessionId  = `snipe_${message.id}`;
@@ -146,7 +186,7 @@ client.on('messageCreate', async (message) => {
       .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
       .setDescription(`**${collected.length} message(s) trouvé(s)** · Page ${page + 1}/${totalPages}`)
       .addFields(fields)
-      .setFooter({ text: `ID : ${targetId} · Boutons actifs 10 min` })
+      .setFooter({ text: `ID : ${targetId} · ${channels.length} salons scannés · Boutons actifs 10 min` })
       .setTimestamp();
   }
 
@@ -175,6 +215,7 @@ client.on('messageCreate', async (message) => {
     components: [buildButtons(0)],
   });
 
+  // ── Collector boutons ──────────────────────────────────────────────────
   const collector = statusMsg.createMessageComponentCollector({ time: 10 * 60 * 1000 });
 
   collector.on('collect', async (interaction) => {
@@ -211,12 +252,24 @@ client.on('messageCreate', async (message) => {
       });
 
       let deleted = 0, failed = 0;
+
       for (const msgData of session.messages) {
         try {
           const ch = await client.channels.fetch(msgData.channelId).catch(() => null);
           const m  = ch ? await ch.messages.fetch(msgData.id).catch(() => null) : null;
           if (m) { await m.delete(); deleted++; }
           else failed++;
+          // Mise à jour du compteur toutes les 20 suppressions
+          if ((deleted + failed) % 20 === 0) {
+            await statusMsg.edit({
+              embeds: [new EmbedBuilder()
+                .setColor(0xFFA500)
+                .setTitle('⏳ Suppression en cours...')
+                .setDescription(`**${deleted + failed}/${session.messages.length}** traités · ✅ ${deleted} supprimés · ❌ ${failed} échecs`)
+                .setTimestamp()],
+              components: [],
+            }).catch(() => {});
+          }
           await new Promise(r => setTimeout(r, 300));
         } catch { failed++; }
       }
