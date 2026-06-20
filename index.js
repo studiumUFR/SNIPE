@@ -12,8 +12,6 @@ const {
 // ── Config ────────────────────────────────────────────────────────────────────
 const TOKEN        = process.env.DISCORD_TOKEN;
 const ADMIN_IDS    = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-// Nombre max de messages à remonter par salon (évite les timeouts sur gros serveurs)
-const MAX_PER_CHANNEL = parseInt(process.env.MAX_PER_CHANNEL || '500');
 
 if (!TOKEN) { console.error('❌ DISCORD_TOKEN manquant !'); process.exit(1); }
 
@@ -28,71 +26,35 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
+// Stockage des sessions snipe en mémoire
 const snipeSessions = new Map();
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function isAdmin(userId) {
   return ADMIN_IDS.includes(userId);
 }
 
-// Fetch TOUS les messages d'un salon jusqu'à MAX_PER_CHANNEL, en paginant
-async function fetchAllMessages(channel, targetId, maxMessages) {
-  const results = [];
-  let lastId    = null;
-  let total     = 0;
-
-  while (total < maxMessages) {
-    const options = { limit: 100 };
-    if (lastId) options.before = lastId;
-
-    let batch;
-    try {
-      batch = await channel.messages.fetch(options);
-    } catch {
-      break;
-    }
-
-    if (batch.size === 0) break;
-
-    for (const [, m] of batch) {
-      if (m.author.id === targetId) {
-        results.push({
-          id:          m.id,
-          channelId:   channel.id,
-          content:     m.content || '*[Pas de texte]*',
-          createdAt:   m.createdTimestamp,
-          url:         m.url,
-          attachments: m.attachments.size,
-        });
-      }
-    }
-
-    // Dernier message du batch = le plus ancien → on continue à partir de là
-    lastId  = batch.last().id;
-    total  += batch.size;
-
-    if (batch.size < 100) break; // Plus de messages dans ce salon
-  }
-
-  return results;
-}
-
+// ── Ready ─────────────────────────────────────────────────────────────────────
 client.on('ready', () => {
   console.log(`✅ Connecté : ${client.user.tag}`);
   console.log(`   Admins   : ${ADMIN_IDS.join(', ') || '⚠️ aucun configuré'}`);
-  console.log(`   Max msgs  : ${MAX_PER_CHANNEL} par salon`);
 });
 
+// ── Messages ──────────────────────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.guild)     return;
 
   const content = message.content.trim();
+
   if (!content.toLowerCase().startsWith('!snipe')) return;
 
+  // Vérification admin
   if (!isAdmin(message.author.id)) {
     return message.reply('❌ Tu n\'as pas la permission d\'utiliser cette commande.');
   }
 
+  // Récupérer la cible (mention ou ID brut)
   const args     = content.split(/\s+/);
   const targetId = message.mentions.users.first()?.id || args[1]?.replace(/\D/g, '');
 
@@ -105,38 +67,37 @@ client.on('messageCreate', async (message) => {
     return message.reply(`❌ Utilisateur introuvable pour l'ID \`${targetId}\`.`);
   }
 
-  const statusMsg = await message.reply(
-    `🔍 Scan profond en cours pour **${targetUser.tag}**...\n` +
-    `*(jusqu'à ${MAX_PER_CHANNEL} messages par salon — peut prendre quelques secondes)*`
+  const statusMsg = await message.reply(`🔍 Scan en cours des messages de **${targetUser.tag}**...`);
+
+  // Récupérer tous les salons texte accessibles par le bot
+  const textChannels = message.guild.channels.cache.filter(ch =>
+    ch.isTextBased() &&
+    !ch.isVoiceBased() &&
+    ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ViewChannel) &&
+    ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ReadMessageHistory)
   );
 
-  // Salons texte accessibles
-  const channels = message.guild.channels.cache
-    .filter(ch =>
-      ch.isTextBased() &&
-      !ch.isVoiceBased() &&
-      ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ViewChannel) &&
-      ch.permissionsFor(message.guild.members.me)?.has(PermissionsBitField.Flags.ReadMessageHistory)
-    )
-    .map(ch => ch);
-
-  // Scan chaque salon séquentiellement (pagination complète)
-  const collected = [];
-  let scanned = 0;
-
-  for (const ch of channels) {
-    scanned++;
-    // Mise à jour du statut toutes les 5 salons
-    if (scanned % 5 === 0) {
-      await statusMsg.edit(
-        `🔍 Scan en cours... **${scanned}/${channels.length}** salons · **${collected.length}** messages trouvés`
-      ).catch(() => {});
-    }
-
-    const msgs = await fetchAllMessages(ch, targetId, MAX_PER_CHANNEL);
-    collected.push(...msgs);
+  // Fetch les 100 derniers messages de chaque salon pour remplir le cache
+  for (const [, ch] of textChannels) {
+    try { await ch.messages.fetch({ limit: 100 }); } catch { /* salon inaccessible */ }
   }
 
+  // Collecter les messages de la cible depuis le cache
+  const collected = [];
+  for (const [, ch] of textChannels) {
+    for (const [, m] of ch.messages.cache.filter(m => m.author.id === targetId)) {
+      collected.push({
+        id:          m.id,
+        channelId:   ch.id,
+        content:     m.content || '*[Pas de texte]*',
+        createdAt:   m.createdTimestamp,
+        url:         m.url,
+        attachments: m.attachments.size,
+      });
+    }
+  }
+
+  // Trier du plus récent au plus ancien
   collected.sort((a, b) => b.createdAt - a.createdAt);
 
   if (collected.length === 0) {
@@ -146,25 +107,25 @@ client.on('messageCreate', async (message) => {
         .setColor(0xFFA500)
         .setTitle('🔍 Aucun message trouvé')
         .setDescription(
-          `Aucun message de <@${targetId}> trouvé.\n` +
-          `> *${channels.length} salons scannés · ${MAX_PER_CHANNEL} msgs max par salon*`
+          `Aucun message de <@${targetId}> n'est présent dans le cache.\n` +
+          `> *Seuls les **100 derniers messages** par salon sont visibles.*`
         )
         .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
         .setTimestamp()],
     });
   }
 
-  // ── Pagination ──────────────────────────────────────────────────────────
+  // ── Pagination ───────────────────────────────────────────────────────────
   const PAGE_SIZE  = 10;
   const totalPages = Math.ceil(collected.length / PAGE_SIZE);
   const sessionId  = `snipe_${message.id}`;
 
   snipeSessions.set(sessionId, {
-    messages:    collected,
-    page:        0,
+    messages:   collected,
+    page:       0,
     totalPages,
     targetId,
-    targetTag:   targetUser.tag,
+    targetTag:  targetUser.tag,
     requesterId: message.author.id,
   });
 
@@ -180,13 +141,14 @@ client.on('messageCreate', async (message) => {
         inline: false,
       };
     });
+
     return new EmbedBuilder()
       .setColor(0xFF4444)
       .setTitle(`🎯 Snipe — ${targetUser.tag}`)
       .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
       .setDescription(`**${collected.length} message(s) trouvé(s)** · Page ${page + 1}/${totalPages}`)
       .addFields(fields)
-      .setFooter({ text: `ID : ${targetId} · ${channels.length} salons scannés · Boutons actifs 10 min` })
+      .setFooter({ text: `ID : ${targetId} · Boutons actifs 10 min` })
       .setTimestamp();
   }
 
@@ -215,7 +177,7 @@ client.on('messageCreate', async (message) => {
     components: [buildButtons(0)],
   });
 
-  // ── Collector boutons ──────────────────────────────────────────────────
+  // ── Collector boutons ────────────────────────────────────────────────────
   const collector = statusMsg.createMessageComponentCollector({ time: 10 * 60 * 1000 });
 
   collector.on('collect', async (interaction) => {
@@ -251,7 +213,8 @@ client.on('messageCreate', async (message) => {
         components: [],
       });
 
-      let deleted = 0, failed = 0;
+      let deleted = 0;
+      let failed  = 0;
 
       for (const msgData of session.messages) {
         try {
@@ -259,18 +222,7 @@ client.on('messageCreate', async (message) => {
           const m  = ch ? await ch.messages.fetch(msgData.id).catch(() => null) : null;
           if (m) { await m.delete(); deleted++; }
           else failed++;
-          // Mise à jour du compteur toutes les 20 suppressions
-          if ((deleted + failed) % 20 === 0) {
-            await statusMsg.edit({
-              embeds: [new EmbedBuilder()
-                .setColor(0xFFA500)
-                .setTitle('⏳ Suppression en cours...')
-                .setDescription(`**${deleted + failed}/${session.messages.length}** traités · ✅ ${deleted} supprimés · ❌ ${failed} échecs`)
-                .setTimestamp()],
-              components: [],
-            }).catch(() => {});
-          }
-          await new Promise(r => setTimeout(r, 300));
+          await new Promise(r => setTimeout(r, 300)); // anti rate-limit
         } catch { failed++; }
       }
 
@@ -300,6 +252,206 @@ client.on('messageCreate', async (message) => {
       statusMsg.edit({ components: [] }).catch(() => {});
     }
   });
+});
+
+// ── Backup / Clone de serveur ────────────────────────────────────────────────
+// Usage : !backupserver <sourceServerId> <targetServerId> <adminRoleId>
+// Copie les rôles (ordre, perms, couleur) et les salons (catégories, ordre,
+// permissions par rôle) du serveur source vers le serveur cible.
+//
+// Prérequis :
+//  - Le bot doit être membre des DEUX serveurs.
+//  - Sur le serveur CIBLE, le rôle du bot doit avoir "Administrator" (ou au
+//    minimum Manage Roles + Manage Channels) ET être placé au-dessus de tous
+//    les rôles qu'il doit créer.
+//  - adminRoleId = l'ID du rôle "admin" sur le serveur SOURCE. Il sert de
+//    repère pour s'assurer que ce rôle est bien recréé et positionné juste
+//    en dessous du rôle du bot sur le serveur cible.
+//
+// Limites connues :
+//  - Les overwrites de permissions ciblant des MEMBRES précis ne sont pas
+//    copiés (les membres diffèrent d'un serveur à l'autre) : seuls les
+//    overwrites liés à des RÔLES sont reproduits.
+//  - @everyone n'est pas recréé : ses permissions sont appliquées au
+//    @everyone existant du serveur cible.
+//  - Aucune suppression sur le serveur cible : la copie s'ajoute par-dessus
+//    l'existant (pas de purge automatique).
+
+const backupSessions = new Map(); // pour éviter les lancements multiples en parallèle
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  const content = message.content.trim();
+  if (!content.toLowerCase().startsWith('!backupserver')) return;
+
+  if (!isAdmin(message.author.id)) {
+    return message.reply('❌ Tu n\'as pas la permission d\'utiliser cette commande.');
+  }
+
+  const args = content.split(/\s+/).slice(1);
+  const [sourceId, targetId, adminRoleId] = args;
+
+  if (!sourceId || !targetId || !adminRoleId) {
+    return message.reply(
+      '**Usage :** `!backupserver <sourceServerId> <targetServerId> <adminRoleId>`\n' +
+      '`adminRoleId` = ID du rôle admin sur le serveur **source**.'
+    );
+  }
+
+  if (backupSessions.has(targetId)) {
+    return message.reply('⏳ Un backup est déjà en cours vers ce serveur cible.');
+  }
+
+  const sourceGuild = await client.guilds.fetch(sourceId).catch(() => null);
+  const targetGuild = await client.guilds.fetch(targetId).catch(() => null);
+
+  if (!sourceGuild) return message.reply(`❌ Le bot n'est pas présent (ou ID invalide) sur le serveur source \`${sourceId}\`.`);
+  if (!targetGuild) return message.reply(`❌ Le bot n'est pas présent (ou ID invalide) sur le serveur cible \`${targetId}\`.`);
+
+  const fullSource = await sourceGuild.fetch();
+  const fullTarget = await targetGuild.fetch();
+
+  const botMemberTarget = await fullTarget.members.fetchMe();
+  if (!botMemberTarget.permissions.has(PermissionsBitField.Flags.Administrator)) {
+    return message.reply('❌ Le bot doit avoir la permission **Administrator** sur le serveur cible pour faire le backup.');
+  }
+
+  const statusMsg = await message.reply(
+    `🔄 Backup en cours : **${fullSource.name}** → **${fullTarget.name}**...\nÉtape 1/2 : rôles...`
+  );
+
+  backupSessions.set(targetId, true);
+
+  try {
+    // ── 1. Rôles ──────────────────────────────────────────────────────────
+    await fullSource.roles.fetch();
+    await fullTarget.roles.fetch();
+
+    const sourceRoles = [...fullSource.roles.cache.values()]
+      .filter(r => r.id !== fullSource.id && !r.managed)
+      .sort((a, b) => a.position - b.position);
+
+    const botTopPosition = botMemberTarget.roles.highest.position;
+
+    const roleIdMap = new Map(); // sourceRoleId -> nouveau rôle créé sur target
+
+    for (const role of sourceRoles) {
+      const created = await fullTarget.roles.create({
+        name:        role.name,
+        color:       role.color,
+        hoist:       role.hoist,
+        permissions: role.permissions,
+        mentionable: role.mentionable,
+        reason:      `Backup serveur ${fullSource.name} (${fullSource.id})`,
+      }).catch(() => null);
+
+      if (created) roleIdMap.set(role.id, created);
+      await new Promise(r => setTimeout(r, 400)); // anti rate-limit
+    }
+
+    const orderedNew = sourceRoles
+      .map(r => roleIdMap.get(r.id))
+      .filter(Boolean);
+
+    if (orderedNew.length > 0) {
+      const positions = orderedNew.map((r, i) => ({
+        role:     r.id,
+        position: Math.max(1, botTopPosition - orderedNew.length + i),
+      }));
+      await fullTarget.roles.setPositions(positions).catch(() => {});
+    }
+
+    const sourceEveryone = fullSource.roles.everyone;
+    await fullTarget.roles.everyone.setPermissions(sourceEveryone.permissions).catch(() => {});
+
+    const adminRoleCopied = roleIdMap.get(adminRoleId);
+    if (!adminRoleCopied) {
+      await statusMsg.edit(
+        `⚠️ Attention : le rôle admin \`${adminRoleId}\` n'a pas été retrouvé/copié (ID invalide ou rôle managé). ` +
+        `Le backup continue quand même.`
+      );
+    }
+
+    await statusMsg.edit(`🔄 Backup en cours : **${fullSource.name}** → **${fullTarget.name}**...\n✅ Rôles copiés (${roleIdMap.size}).\nÉtape 2/2 : salons...`);
+
+    // ── 2. Salons (catégories d'abord, puis le reste) ───────────────────────
+    await fullSource.channels.fetch();
+
+    function buildOverwrites(channel) {
+      const overwrites = [];
+      for (const [, ow] of channel.permissionOverwrites.cache) {
+        if (ow.type === 0) {
+          const newRoleId = ow.id === fullSource.id ? fullTarget.id : roleIdMap.get(ow.id)?.id;
+          if (newRoleId) {
+            overwrites.push({ id: newRoleId, allow: ow.allow, deny: ow.deny, type: 0 });
+          }
+        }
+        // type 1 = membre → ignoré volontairement (cf. limites en commentaire)
+      }
+      return overwrites;
+    }
+
+    const sourceChannels = [...fullSource.channels.cache.values()];
+    const categories = sourceChannels
+      .filter(c => c.type === 4) // GuildCategory
+      .sort((a, b) => a.position - b.position);
+    const others = sourceChannels
+      .filter(c => c.type !== 4)
+      .sort((a, b) => a.position - b.position);
+
+    const channelIdMap = new Map();
+
+    for (const cat of categories) {
+      const created = await fullTarget.channels.create({
+        name: cat.name,
+        type: 4,
+        permissionOverwrites: buildOverwrites(cat),
+        reason: `Backup serveur ${fullSource.name}`,
+      }).catch(() => null);
+      if (created) channelIdMap.set(cat.id, created);
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    for (const ch of others) {
+      const opts = {
+        name: ch.name,
+        type: ch.type,
+        permissionOverwrites: buildOverwrites(ch),
+        reason: `Backup serveur ${fullSource.name}`,
+      };
+      if (ch.parentId && channelIdMap.has(ch.parentId)) {
+        opts.parent = channelIdMap.get(ch.parentId).id;
+      }
+      if (typeof ch.topic === 'string') opts.topic = ch.topic;
+      if (typeof ch.nsfw === 'boolean') opts.nsfw = ch.nsfw;
+      if (typeof ch.bitrate === 'number') opts.bitrate = ch.bitrate;
+      if (typeof ch.userLimit === 'number') opts.userLimit = ch.userLimit;
+      if (typeof ch.rateLimitPerUser === 'number') opts.rateLimitPerUser = ch.rateLimitPerUser;
+
+      const created = await fullTarget.channels.create(opts).catch(() => null);
+      if (created) channelIdMap.set(ch.id, created);
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    await statusMsg.edit({
+      content: null,
+      embeds: [new EmbedBuilder()
+        .setColor(0x57F287)
+        .setTitle('✅ Backup terminé')
+        .setDescription(`**${fullSource.name}** → **${fullTarget.name}**`)
+        .addFields(
+          { name: 'Rôles copiés',  value: `${roleIdMap.size}`,    inline: true },
+          { name: 'Salons copiés', value: `${channelIdMap.size}`, inline: true },
+        )
+        .setFooter({ text: 'Les overwrites par membre (pas par rôle) n\'ont pas été copiés.' })
+        .setTimestamp()],
+    });
+  } catch (err) {
+    console.error(err);
+    await statusMsg.edit(`❌ Erreur pendant le backup : ${err.message || err}`).catch(() => {});
+  } finally {
+    backupSessions.delete(targetId);
+  }
 });
 
 client.login(TOKEN);
